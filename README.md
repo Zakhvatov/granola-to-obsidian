@@ -9,9 +9,8 @@
 Import **one selected Granola note** into an Obsidian vault from its public
 share link. No API key, OAuth app, or paid Granola plan required.
 
-Granola has no built-in Obsidian integration. The usual options are to sync all
-notes (and get everything, wanted or not) or to copy them by hand. This tool
-takes a different route:
+Granola does not provide a built-in way to save a single note to Obsidian.
+This tool does exactly that:
 
 1. In Granola, open a note and use **Share -> Copy link**.
 2. Press a keyboard shortcut (or run `granola-import`).
@@ -19,19 +18,6 @@ takes a different route:
 
 The note is read from the page Granola serves for the share link. Nothing is
 read from the Granola app, its cache, or your account.
-
-## Why a CLI and not an Obsidian plugin?
-
-A CLI plus a small macOS Service works with any Obsidian setup, needs no plugin
-API, and cannot break when Obsidian changes its plugin internals. It also keeps
-the import explicit: nothing runs on a schedule, and nothing is imported unless
-you ask for that note.
-
-The Obsidian plugin used in some setups,
-[`philfreo/obsidian-granola-plugin`](https://github.com/philfreo/obsidian-granola-plugin),
-is a third-party project. It is not included here because it is not ours to
-republish. If you prefer a plugin that syncs notes automatically, use that one;
-if you want one note on demand, use this tool.
 
 ## Features
 
