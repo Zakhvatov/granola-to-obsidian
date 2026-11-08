@@ -1,5 +1,11 @@
 # Granola to Obsidian
 
+**English** | [Русский](README.ru.md)
+
+[![CI](https://github.com/Zakhvatov/granola-to-obsidian/actions/workflows/ci.yml/badge.svg)](https://github.com/Zakhvatov/granola-to-obsidian/actions/workflows/ci.yml)
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+[![Python 3.9+](https://img.shields.io/badge/python-3.9%2B-blue.svg)](https://www.python.org/)
+
 Import **one selected Granola note** into an Obsidian vault from its public
 share link. No API key, OAuth app, or paid Granola plan required.
 
@@ -11,8 +17,21 @@ takes a different route:
 2. Press a keyboard shortcut (or run `granola-import`).
 3. Only that note is written to your vault as Markdown.
 
-The note is taken from the page Granola serves for the share link. Nothing is
+The note is read from the page Granola serves for the share link. Nothing is
 read from the Granola app, its cache, or your account.
+
+## Why a CLI and not an Obsidian plugin?
+
+A CLI plus a small macOS Service works with any Obsidian setup, needs no plugin
+API, and cannot break when Obsidian changes its plugin internals. It also keeps
+the import explicit: nothing runs on a schedule, and nothing is imported unless
+you ask for that note.
+
+The Obsidian plugin used in some setups,
+[`philfreo/obsidian-granola-plugin`](https://github.com/philfreo/obsidian-granola-plugin),
+is a third-party project. It is not included here because it is not ours to
+republish. If you prefer a plugin that syncs notes automatically, use that one;
+if you want one note on demand, use this tool.
 
 ## Features
 
@@ -23,11 +42,12 @@ read from the Granola app, its cache, or your account.
 - Frontmatter includes `granola_id` and the share URL.
 - Duplicate-safe: re-importing the same note does not create a second file.
 - Optional macOS Service so the whole flow is "Copy link -> press shortcut".
+- Pure Python standard library; `curl` does the HTTP request.
 
 ## Requirements
 
 - macOS (clipboard access and the optional Service use macOS tools).
-- Python 3 (the system Python is enough).
+- Python 3.9+ (the system Python is enough).
 - Obsidian with a local vault.
 - `curl` (ships with macOS).
 
@@ -73,7 +93,8 @@ export GRANOLA_VAULT="$HOME/Documents/My Vault"
 export GRANOLA_FOLDER="Meetings/Granola"
 ```
 
-Or pass `--vault` / `--folder` on the command line.
+Or pass `--vault` / `--folder` on the command line. Run
+`granola-import --help` for all options.
 
 ## What gets imported
 
@@ -91,6 +112,20 @@ Or pass `--vault` / `--folder` on the command line.
   format may change; if it does, parsing can break.
 - The tool is intended for your own notes. Respect Granola's terms and the
   privacy of meeting participants.
+
+## Development
+
+```bash
+python3 -m venv .venv
+source .venv/bin/activate
+pip install -r requirements-dev.txt
+pytest
+ruff check .
+shellcheck install.sh
+```
+
+Tests use synthetic fixtures only; do not commit real meeting content, share
+links, tokens or personal paths.
 
 ## Troubleshooting
 

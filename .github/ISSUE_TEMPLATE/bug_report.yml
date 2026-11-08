@@ -1,0 +1,49 @@
+name: Bug report
+description: Something does not work as expected
+title: "[bug]: "
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for the report. Please do not paste real meeting content,
+        `notes.granola.ai` share links, tokens or personal paths.
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened?
+      description: What did you run, and what did you expect instead?
+    validations:
+      required: true
+  - type: input
+    id: version
+    attributes:
+      label: Version
+      description: Output of `granola-import --version`
+    validations:
+      required: true
+  - type: dropdown
+    id: macos
+    attributes:
+      label: macOS version
+      options:
+        - macOS 26
+        - macOS 15
+        - macOS 14
+        - macOS 13
+        - Other
+    validations:
+      required: true
+  - type: textarea
+    id: logs
+    attributes:
+      label: Relevant log lines
+      description: From `~/.local/state/granola-import.log`, with personal data removed
+      render: text
+  - type: checkboxes
+    id: confirm
+    attributes:
+      label: Confirmation
+      options:
+        - label: I removed meeting content, share links, tokens and personal paths from this report
+          required: true
