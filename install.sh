@@ -5,6 +5,18 @@ ROOT="$(cd "$(dirname "$0")" && pwd)"
 BIN="$HOME/.local/bin"
 WORKFLOW="$HOME/Library/Services/Granola to Obsidian.workflow"
 
+if [ "$(uname -s)" != "Darwin" ]; then
+  echo "This installer uses macOS Services and requires macOS." >&2
+  exit 1
+fi
+
+for tool in python3 curl; do
+  if ! command -v "$tool" >/dev/null 2>&1; then
+    echo "Missing required tool: $tool" >&2
+    exit 1
+  fi
+done
+
 mkdir -p "$BIN"
 install -m 755 "$ROOT/bin/granola-import" "$BIN/granola-import"
 
