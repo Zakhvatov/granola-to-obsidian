@@ -1,0 +1,390 @@
+#!/usr/bin/env python3
+"""Import a single Granola meeting note into an Obsidian vault by its public share link.
+
+Granola does not ship an Obsidian integration. This tool takes the public
+"Share -> Copy link" URL of one note, reads the note that Granola renders on
+that page, and writes it as a Markdown file into an Obsidian vault.
+
+No API key, OAuth app or Granola plan is required.
+
+Usage:
+    granola-import                      # read the Granola link from the clipboard
+    granola-import <url>                # import this link
+    granola-import --force <url>        # overwrite an existing import
+    granola-import --vault ~/Vault --folder Meetings/Granola <url>
+
+Environment:
+    GRANOLA_VAULT    vault root (default: auto-detected from Obsidian)
+    GRANOLA_FOLDER   folder inside the vault (default: Granola)
+
+Requires macOS for clipboard access and notifications. The import itself is
+plain Python 3 and curl.
+"""
+
+import argparse
+import html
+import json
+import os
+import re
+import subprocess
+import sys
+from datetime import datetime
+
+DEFAULT_FOLDER = "Granola"
+LOG = os.path.expanduser("~/.local/state/granola-import.log")
+UA = (
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+    "AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.0 Safari/605.1.15"
+)
+
+
+def log(line):
+    try:
+        os.makedirs(os.path.dirname(LOG), exist_ok=True)
+        with open(LOG, "a", encoding="utf-8") as fh:
+            fh.write(f"{datetime.now().isoformat(timespec='seconds')} {line}\n")
+    except Exception:
+        pass
+
+
+def notify(message, title="Granola → Obsidian"):
+    if sys.platform != "darwin":
+        return
+    try:
+        subprocess.run(
+            [
+                "/usr/bin/osascript",
+                "-e",
+                "display notification "
+                + json.dumps(message, ensure_ascii=False)
+                + " with title "
+                + json.dumps(title, ensure_ascii=False),
+            ],
+            check=False,
+            timeout=5,
+        )
+    except Exception:
+        pass
+
+
+def die(message):
+    log(f"error: {message}")
+    print(f"error: {message}", file=sys.stderr)
+    notify(message)
+    sys.exit(1)
+
+
+def clipboard():
+    if sys.platform != "darwin":
+        return ""
+    try:
+        return subprocess.run(
+            ["/usr/bin/pbpaste"], capture_output=True, text=True, timeout=5
+        ).stdout
+    except Exception:
+        return ""
+
+
+def find_url(text):
+    match = re.search(r"https://notes\.granola\.ai/[td]/[A-Za-z0-9._-]+", text or "")
+    return match.group(0) if match else None
+
+
+def detect_vault():
+    env = os.environ.get("GRANOLA_VAULT")
+    if env:
+        return os.path.expanduser(env)
+
+    config = os.path.expanduser("~/Library/Application Support/obsidian/obsidian.json")
+    try:
+        with open(config, encoding="utf-8") as fh:
+            data = json.load(fh)
+        vaults = list((data.get("vaults") or {}).values())
+        opened = [v for v in vaults if v.get("open")]
+        if len(opened) == 1:
+            return opened[0]["path"]
+        if len(vaults) == 1:
+            return vaults[0]["path"]
+    except Exception:
+        pass
+
+    return os.path.expanduser("~/Documents/Obsidian Vault")
+
+
+def fetch(url):
+    # curl is used instead of urllib: Homebrew Python often has no CA bundle,
+    # and curl honours the user's proxy/VPN settings the same way a browser does.
+    proc = subprocess.run(
+        [
+            "/usr/bin/curl",
+            "-sSL",
+            "--max-time",
+            "30",
+            "--proto",
+            "=https",
+            "-A",
+            UA,
+            "-H",
+            "Accept: text/html,application/xhtml+xml",
+            "-H",
+            "Accept-Language: en-US,en;q=0.9",
+            url,
+        ],
+        capture_output=True,
+        timeout=40,
+    )
+    if proc.returncode != 0:
+        raise RuntimeError(
+            proc.stderr.decode("utf-8", "replace").strip()
+            or f"curl exit {proc.returncode}"
+        )
+    return proc.stdout.decode("utf-8", "replace")
+
+
+def extract_payload(page):
+    """Pull the Next.js flight payload and decode one escaping level."""
+    chunks = re.findall(r'self\.__next_f\.push\(\[1,"((?:[^"\\]|\\.)*)"\]\)', page)
+    if not chunks:
+        return page
+    raw = "".join(chunks)
+    try:
+        return json.loads('"' + raw + '"')
+    except Exception:
+        return raw
+
+
+def parse_note(page, url):
+    title_tag = re.search(r"<title>(.*?)</title>", page, re.S)
+    page_title = html.unescape(title_tag.group(1).strip()) if title_tag else ""
+
+    data = extract_payload(page)
+    panel = None
+    idx = data.find('"documentPanel":')
+    if idx >= 0:
+        brace = data.find("{", idx)
+        try:
+            panel, _ = json.JSONDecoder().raw_decode(data[brace:])
+        except Exception:
+            panel = None
+
+    doc = (panel or {}).get("document") or {}
+    panel_data = (panel or {}).get("panel") or {}
+    meta = (panel or {}).get("documentMetadata") or {}
+
+    note_id = doc.get("id") or ""
+    title = (doc.get("title") or "").strip() or page_title or "Granola note"
+    created = doc.get("created_at") or ""
+    body_html = panel_data.get("original_content") or ""
+
+    if not body_html and panel_data.get("content"):
+        body_html = prosemirror_to_html(panel_data["content"])
+
+    attendees = []
+    for attendee in meta.get("attendees") or []:
+        if isinstance(attendee, str):
+            attendees.append(attendee)
+        elif isinstance(attendee, dict):
+            name = attendee.get("name") or attendee.get("email")
+            if name:
+                attendees.append(name)
+
+    return {
+        "id": note_id,
+        "title": title,
+        "created": created,
+        "attendees": attendees,
+        "html": body_html,
+        "url": url,
+    }
+
+
+def prosemirror_to_html(node):
+    """Minimal ProseMirror JSON -> HTML, enough for Granola note panels."""
+    node_type = node.get("type")
+    content = "".join(prosemirror_to_html(child) for child in node.get("content") or [])
+    if node_type == "text":
+        text = html.escape(node.get("text", ""))
+        for mark in node.get("marks") or []:
+            mark_type = mark.get("type")
+            if mark_type == "bold":
+                text = f"<strong>{text}</strong>"
+            elif mark_type == "italic":
+                text = f"<em>{text}</em>"
+            elif mark_type == "code":
+                text = f"<code>{text}</code>"
+            elif mark_type == "link":
+                href = html.escape(
+                    (mark.get("attrs") or {}).get("href") or "", quote=True
+                )
+                text = f'<a href="{href}">{text}</a>'
+        return text
+    if node_type == "paragraph":
+        return f"<p>{content}</p>"
+    if node_type == "heading":
+        level = min(6, max(1, (node.get("attrs") or {}).get("level", 2)))
+        return f"<h{level}>{content}</h{level}>"
+    if node_type in ("bulletList", "orderedList"):
+        tag = "ul" if node_type == "bulletList" else "ol"
+        return f"<{tag}>{content}</{tag}>"
+    if node_type == "listItem":
+        return f"<li>{content}</li>"
+    if node_type == "blockquote":
+        return f"<blockquote>{content}</blockquote>"
+    if node_type == "codeBlock":
+        return f"<pre>{content}</pre>"
+    if node_type == "horizontalRule":
+        return "<hr>"
+    if node_type == "hardBreak":
+        return "<br>"
+    return content
+
+
+def html_to_markdown(fragment):
+    text = re.sub(r"(?is)<(script|style)[^>]*>.*?</\1>", "", fragment or "")
+    text = re.sub(
+        r"(?is)<h([1-6])[^>]*>(.*?)</h\1>",
+        lambda m: "\n\n" + "#" * int(m.group(1)) + " " + m.group(2).strip() + "\n\n",
+        text,
+    )
+    text = re.sub(r"(?is)<(strong|b)[^>]*>(.*?)</\1>", r"**\2**", text)
+    text = re.sub(r"(?is)<(em|i)[^>]*>(.*?)</\1>", r"*\2*", text)
+    text = re.sub(r"(?is)<code[^>]*>(.*?)</code>", r"`\1`", text)
+    text = re.sub(r'(?is)<a [^>]*href="([^"]*)"[^>]*>(.*?)</a>', r"[\2](\1)", text)
+    text = re.sub(
+        r"(?is)<li[^>]*>(.*?)</li>",
+        lambda m: "- " + re.sub(r"\s+", " ", m.group(1)).strip() + "\n",
+        text,
+    )
+    text = re.sub(r"(?is)<(ul|ol)[^>]*>", "\n", text)
+    text = re.sub(r"(?is)</(ul|ol)>", "\n", text)
+    text = re.sub(r"(?is)<blockquote[^>]*>(.*?)</blockquote>", r"> \1\n", text)
+    text = re.sub(r"(?is)<hr\s*/?>", "\n\n---\n\n", text)
+    text = re.sub(r"(?is)<br\s*/?>", "\n", text)
+    text = re.sub(r"(?is)</p>", "\n\n", text)
+    text = re.sub(r"(?is)<p[^>]*>", "", text)
+    text = re.sub(r"(?s)<[^>]+>", "", text)
+    text = html.unescape(text)
+    text = re.sub(r"[ \t]+\n", "\n", text)
+    text = re.sub(r"\n{3,}", "\n\n", text)
+    return text.strip()
+
+
+def yaml_quote(value):
+    return '"' + str(value).replace("\\", "\\\\").replace('"', '\\"') + '"'
+
+
+def sanitize_filename(name):
+    name = re.sub(r'[\\/:*?"<>|#^\[\]]', "-", name)
+    name = re.sub(r"\s+", " ", name).strip(" .-")
+    return name[:90] or "Granola note"
+
+
+def local_date(created):
+    try:
+        dt = datetime.fromisoformat(created.replace("Z", "+00:00"))
+        return dt.astimezone().strftime("%Y-%m-%d")
+    except Exception:
+        return datetime.now().strftime("%Y-%m-%d")
+
+
+def already_imported(folder, note_id):
+    if not note_id or not os.path.isdir(folder):
+        return None
+    marker = f"granola_id: {note_id}"
+    for name in os.listdir(folder):
+        if not name.endswith(".md"):
+            continue
+        path = os.path.join(folder, name)
+        try:
+            with open(path, encoding="utf-8", errors="ignore") as fh:
+                if marker in fh.read(4096):
+                    return path
+        except OSError:
+            continue
+    return None
+
+
+def build_markdown(note):
+    body = html_to_markdown(note["html"]).strip() or (
+        "(summary is not available on the public share page)"
+    )
+    lines = [
+        "---",
+        f"granola_id: {note['id']}",
+        f"granola_url: {note['url']}",
+        f"title: {yaml_quote(note['title'])}",
+        f"date: {local_date(note['created'])}",
+        "attendees:",
+    ]
+    for person in note["attendees"]:
+        lines.append(f"  - {yaml_quote('[[' + person + ']]')}")
+    lines += ["tags:", "  - meeting", "  - granola", "---", "", "## Summary", "", body, ""]
+    return "\n".join(lines)
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="Import one Granola note into an Obsidian vault by its public share link."
+    )
+    parser.add_argument("url", nargs="?", help="Granola share link (default: clipboard)")
+    parser.add_argument("--force", action="store_true", help="overwrite an existing import")
+    parser.add_argument("--vault", help="Obsidian vault root")
+    parser.add_argument("--folder", help="folder inside the vault (default: Granola)")
+    parser.add_argument("--no-notify", action="store_true", help="disable macOS notifications")
+    args = parser.parse_args()
+
+    if args.no_notify:
+        global notify
+        notify = lambda *a, **k: None
+
+    url = args.url or find_url(clipboard())
+    if not url:
+        die("no notes.granola.ai link found (use Share -> Copy link in Granola)")
+    url = find_url(url) or url
+    if not re.match(r"^https://notes\.granola\.ai/[td]/", url):
+        die("this does not look like a Granola share link")
+    log(f"start url={url}")
+
+    try:
+        page = fetch(url)
+    except Exception as exc:
+        die(f"could not download the note: {exc}")
+
+    note = parse_note(page, url)
+    if not note["id"]:
+        die("could not find note data on the page (private link or page format changed)")
+
+    vault = os.path.expanduser(args.vault) if args.vault else detect_vault()
+    folder = args.folder or os.environ.get("GRANOLA_FOLDER", DEFAULT_FOLDER)
+    folder_path = os.path.join(vault, folder)
+    os.makedirs(folder_path, exist_ok=True)
+
+    existing = already_imported(folder_path, note["id"])
+    if existing and not args.force:
+        log(f"skip existing={existing}")
+        print(f"already imported: {existing}")
+        notify("This note is already in Obsidian")
+        return 0
+
+    if existing and args.force:
+        path = existing
+    else:
+        path = os.path.join(
+            folder_path,
+            f"{local_date(note['created'])} {sanitize_filename(note['title'])}.md",
+        )
+        if os.path.exists(path):
+            base, ext = os.path.splitext(path)
+            path = f"{base} (2){ext}"
+
+    with open(path, "w", encoding="utf-8") as fh:
+        fh.write(build_markdown(note))
+
+    log(f"imported={path}")
+    print(path)
+    notify("Note imported into Obsidian")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
