@@ -29,11 +29,12 @@ import re
 import subprocess
 import sys
 from datetime import datetime
+from html.parser import HTMLParser
 
 DEFAULT_FOLDER = "Granola"
 DEFAULT_VAULT = os.path.expanduser("~/Documents/Obsidian Vault")
 LOG = os.path.expanduser("~/.local/state/granola-import.log")
-__version__ = "1.0.0"
+__version__ = "1.0.1"
 UA = (
     "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
     "AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.0 Safari/605.1.15"
@@ -74,6 +75,111 @@ def die(message):
     print(f"error: {message}", file=sys.stderr)
     notify(message)
     sys.exit(1)
+
+
+def caller_app():
+    """Best-effort name of the app that started this process.
+
+    macOS gives an Automator Service the permissions of the app that runs the
+    workflow, not of the app the shortcut was pressed in, so the hint has to
+    name the real caller.
+    """
+    if sys.platform != "darwin":
+        return None
+    pid = str(os.getppid())
+    for _ in range(6):
+        try:
+            out = subprocess.run(
+                ["/bin/ps", "-o", "ppid=,command=", "-p", pid],
+                capture_output=True,
+                text=True,
+                timeout=3,
+            ).stdout.strip()
+        except Exception:
+            return None
+        if not out:
+            return None
+        parent, _, command = out.partition(" ")
+        if ".app/Contents/MacOS/" in command:
+            name = command.split(".app/Contents/MacOS/")[0].rsplit("/", 1)[-1]
+            return name or None
+        parent = parent.strip()
+        if parent in ("", "0", "1"):
+            return None
+        pid = parent
+    return None
+
+
+def protected_folder(path):
+    """Label of the macOS privacy-protected folder that contains path, if any."""
+    if sys.platform != "darwin":
+        return None
+    home = os.path.expanduser("~")
+    folders = [
+        (os.path.join(home, "Desktop"), "Desktop"),
+        (os.path.join(home, "Documents"), "Documents"),
+        (os.path.join(home, "Downloads"), "Downloads"),
+        (os.path.join(home, "Library", "Mobile Documents"), "iCloud Drive"),
+    ]
+    target = os.path.realpath(path)
+    for base, label in folders:
+        root = os.path.realpath(base)
+        if target == root or target.startswith(root + os.sep):
+            return label
+    return None
+
+
+def vault_error(exc, path):
+    """Explain a filesystem failure in terms the user can act on."""
+    if not isinstance(exc, PermissionError):
+        return f"cannot use {path}: {exc}"
+
+    app = caller_app() or "the app that runs the import"
+    folder = protected_folder(path)
+    if folder:
+        return (
+            f"macOS privacy protection does not let {app} read {path} (it lives in {folder}). "
+            "Open System Settings -> Privacy & Security -> Full Disk Access, "
+            f"enable {app}, then run the import again"
+        )
+    return f"no permission to use {path} (check the owner and mode of the folder)"
+
+
+def open_privacy_settings():
+    if sys.platform != "darwin":
+        return
+    try:
+        subprocess.run(
+            [
+                "/usr/bin/open",
+                "x-apple.systempreferences:com.apple.preference.security?Privacy_AllFiles",
+            ],
+            check=False,
+            timeout=5,
+        )
+    except Exception:
+        return
+
+
+def die_vault_error(exc, path):
+    """Report an unusable vault folder and show where to fix the permission."""
+    if isinstance(exc, PermissionError) and protected_folder(path):
+        open_privacy_settings()
+    die(vault_error(exc, path))
+
+
+def check_vault(folder_path):
+    """Create the target folder and prove it can be read.
+
+    Reading the directory is the cheapest reliable probe: macOS allows stat() on
+    a protected folder but refuses to list it, so a bare isdir()/access() check
+    passes and the failure only shows up later, on the first real read or write.
+    """
+    try:
+        os.makedirs(folder_path, exist_ok=True)
+        os.listdir(folder_path)
+    except OSError as exc:
+        die_vault_error(exc, folder_path)
 
 
 def clipboard():
@@ -155,11 +261,52 @@ def extract_payload(page):
         return raw
 
 
+def flight_text_chunks(payload):
+    """Map flight text rows to their text.
+
+    Next.js may keep large strings out of line: a row like `6b:T2137,<utf8>`
+    says "row 6b is text, 0x2137 bytes long", and the field itself only holds
+    the reference "$6b".
+    """
+    chunks = {}
+    data = payload.encode("utf-8")
+    for match in re.finditer(rb"(?:\A|\n)([0-9a-f]+):T([0-9a-f]+),", data):
+        start = match.end()
+        size = int(match.group(2), 16)
+        chunks[match.group(1).decode()] = data[start:start + size].decode("utf-8", "replace")
+    return chunks
+
+
+def generated_lines_to_html(lines):
+    """Flat fallback: the summary as a list of plain text lines."""
+    parts = []
+    for line in lines:
+        text = line.get("text") if isinstance(line, dict) else line
+        if text:
+            parts.append(f"<p>{html.escape(str(text))}</p>")
+    return "".join(parts)
+
+
+def resolve_flight_refs(value, chunks):
+    """Replace "$6b"-style references with the text they point at."""
+    if isinstance(value, str):
+        match = re.fullmatch(r"\$([0-9a-f]+)", value)
+        if match and match.group(1) in chunks:
+            return chunks[match.group(1)]
+        return value
+    if isinstance(value, dict):
+        return {key: resolve_flight_refs(item, chunks) for key, item in value.items()}
+    if isinstance(value, list):
+        return [resolve_flight_refs(item, chunks) for item in value]
+    return value
+
+
 def parse_note(page, url):
     title_tag = re.search(r"<title>(.*?)</title>", page, re.S)
     page_title = html.unescape(title_tag.group(1).strip()) if title_tag else ""
 
     data = extract_payload(page)
+    chunks = flight_text_chunks(data)
     panel = None
     idx = data.find('"documentPanel":')
     if idx >= 0:
@@ -168,6 +315,7 @@ def parse_note(page, url):
             panel, _ = json.JSONDecoder().raw_decode(data[brace:])
         except Exception:
             panel = None
+    panel = resolve_flight_refs(panel, chunks) if panel else panel
 
     doc = (panel or {}).get("document") or {}
     panel_data = (panel or {}).get("panel") or {}
@@ -180,6 +328,8 @@ def parse_note(page, url):
 
     if not body_html and panel_data.get("content"):
         body_html = prosemirror_to_html(panel_data["content"])
+    if not body_html:
+        body_html = generated_lines_to_html(panel_data.get("generated_lines") or [])
 
     attendees = []
     for attendee in meta.get("attendees") or []:
@@ -241,34 +391,155 @@ def prosemirror_to_html(node):
     return content
 
 
+VOID_TAGS = {"br", "hr", "img", "meta", "link", "input", "source", "col"}
+
+
+class _HTMLNode:
+    def __init__(self, tag=None, attrs=None):
+        self.tag = tag
+        self.attrs = dict(attrs or {})
+        self.children = []
+
+
+class _HTMLTree(HTMLParser):
+    def __init__(self):
+        super().__init__(convert_charrefs=True)
+        self.root = _HTMLNode()
+        self.stack = [self.root]
+
+    def handle_starttag(self, tag, attrs):
+        node = _HTMLNode(tag, attrs)
+        self.stack[-1].children.append(node)
+        if tag not in VOID_TAGS:
+            self.stack.append(node)
+
+    def handle_startendtag(self, tag, attrs):
+        self.stack[-1].children.append(_HTMLNode(tag, attrs))
+
+    def handle_endtag(self, tag):
+        for index in range(len(self.stack) - 1, 0, -1):
+            if self.stack[index].tag == tag:
+                del self.stack[index:]
+                return
+
+    def handle_data(self, data):
+        self.stack[-1].children.append(data)
+
+
+def collapse_space(text):
+    text = re.sub(r"[ \t\r\f\v]+", " ", text)
+    text = re.sub(r" *\n[ \n]*", "\n", text)
+    return text.strip()
+
+
+def inline_markdown(node):
+    """Render inline markup: bold, italics, code, links, line breaks."""
+    if isinstance(node, str):
+        return node
+    inner = "".join(inline_markdown(child) for child in node.children)
+    tag = node.tag
+    if tag in ("script", "style", "head", "ul", "ol"):
+        return ""
+    if tag in ("strong", "b"):
+        return f"**{inner}**" if inner.strip() else inner
+    if tag in ("em", "i"):
+        return f"*{inner}*" if inner.strip() else inner
+    if tag == "code":
+        return f"`{inner}`"
+    if tag == "a":
+        href = (node.attrs.get("href") or "").strip()
+        label = inner.strip()
+        return f"[{label}]({href})" if href else label
+    if tag == "br":
+        return "\n"
+    return inner
+
+
+def list_lines(node, indent):
+    """Render <ul>/<ol> keeping nesting, so sub-bullets stay sub-bullets."""
+    lines = []
+    ordered = node.tag == "ol"
+    number = 1
+    for item in node.children:
+        if isinstance(item, str) or item.tag != "li":
+            continue
+        marker = f"{number}." if ordered else "-"
+        number += 1
+        inline = []
+        nested = []
+        for child in item.children:
+            if isinstance(child, str):
+                inline.append(child)
+            elif child.tag in ("ul", "ol"):
+                nested.append(child)
+            else:
+                inline.append(inline_markdown(child))
+        head = collapse_space("".join(inline))
+        lines.append("  " * indent + f"{marker} {head}".rstrip())
+        for sub in nested:
+            lines.extend(list_lines(sub, indent + 1))
+    return lines
+
+
+def block_markdown(nodes):
+    parts = []
+    for node in nodes:
+        if isinstance(node, str):
+            text = collapse_space(node)
+            if text:
+                parts.append(text + "\n\n")
+            continue
+        tag = node.tag
+        if tag in ("script", "style"):
+            continue
+        if tag in ("h1", "h2", "h3", "h4", "h5", "h6"):
+            text = collapse_space(inline_markdown(node))
+            if text:
+                parts.append("#" * int(tag[1]) + " " + text + "\n\n")
+        elif tag == "p":
+            text = collapse_space(inline_markdown(node))
+            if text:
+                parts.append(text + "\n\n")
+        elif tag in ("ul", "ol"):
+            lines = list_lines(node, 0)
+            if lines:
+                parts.append("\n".join(lines) + "\n\n")
+        elif tag == "hr":
+            parts.append("---\n\n")
+        elif tag == "blockquote":
+            inner = block_markdown(node.children).strip()
+            if inner:
+                quoted = "\n".join("> " + line if line else ">" for line in inner.split("\n"))
+                parts.append(quoted + "\n\n")
+        elif tag == "pre":
+            code = "".join(child for child in node.children if isinstance(child, str))
+            parts.append("```\n" + code.strip("\n") + "\n```\n\n")
+        elif tag == "br":
+            parts.append("\n")
+        else:
+            parts.append(block_markdown(node.children))
+    return "".join(parts)
+
+
 def html_to_markdown(fragment):
-    text = re.sub(r"(?is)<(script|style)[^>]*>.*?</\1>", "", fragment or "")
-    text = re.sub(
-        r"(?is)<h([1-6])[^>]*>(.*?)</h\1>",
-        lambda m: "\n\n" + "#" * int(m.group(1)) + " " + m.group(2).strip() + "\n\n",
-        text,
-    )
-    text = re.sub(r"(?is)<(strong|b)[^>]*>(.*?)</\1>", r"**\2**", text)
-    text = re.sub(r"(?is)<(em|i)[^>]*>(.*?)</\1>", r"*\2*", text)
-    text = re.sub(r"(?is)<code[^>]*>(.*?)</code>", r"`\1`", text)
-    text = re.sub(r'(?is)<a [^>]*href="([^"]*)"[^>]*>(.*?)</a>', r"[\2](\1)", text)
-    text = re.sub(
-        r"(?is)<li[^>]*>(.*?)</li>",
-        lambda m: "- " + re.sub(r"\s+", " ", m.group(1)).strip() + "\n",
-        text,
-    )
-    text = re.sub(r"(?is)<(ul|ol)[^>]*>", "\n", text)
-    text = re.sub(r"(?is)</(ul|ol)>", "\n", text)
-    text = re.sub(r"(?is)<blockquote[^>]*>(.*?)</blockquote>", r"> \1\n", text)
-    text = re.sub(r"(?is)<hr\s*/?>", "\n\n---\n\n", text)
-    text = re.sub(r"(?is)<br\s*/?>", "\n", text)
-    text = re.sub(r"(?is)</p>", "\n\n", text)
-    text = re.sub(r"(?is)<p[^>]*>", "", text)
-    text = re.sub(r"(?s)<[^>]+>", "", text)
-    text = html.unescape(text)
+    parser = _HTMLTree()
+    parser.feed(fragment or "")
+    parser.close()
+    text = block_markdown(parser.root.children)
     text = re.sub(r"[ \t]+\n", "\n", text)
     text = re.sub(r"\n{3,}", "\n\n", text)
     return text.strip()
+
+
+def demote_headings(markdown):
+    """Keep one h1 per note: push body headings one level down."""
+    if not re.search(r"(?m)^# ", markdown):
+        return markdown
+
+    def bump(match):
+        return "#" * min(6, len(match.group(1)) + 1) + " "
+
+    return re.sub(r"(?m)^(#{1,6}) ", bump, markdown)
 
 
 def yaml_quote(value):
@@ -307,7 +578,7 @@ def already_imported(folder, note_id):
 
 
 def build_markdown(note):
-    body = html_to_markdown(note["html"]).strip() or (
+    body = demote_headings(html_to_markdown(note["html"])).strip() or (
         "(summary is not available on the public share page)"
     )
     lines = [
@@ -351,6 +622,12 @@ def main():
         die("this does not look like a Granola share link")
     log(f"start url={url}")
 
+    vault = os.path.expanduser(args.vault) if args.vault else detect_vault()
+    folder = args.folder or os.environ.get("GRANOLA_FOLDER", DEFAULT_FOLDER)
+    folder_path = os.path.join(vault, folder)
+    # Fail fast and loudly: a vault we cannot reach should not cost a download.
+    check_vault(folder_path)
+
     try:
         page = fetch(url)
     except Exception as exc:
@@ -360,12 +637,10 @@ def main():
     if not note["id"]:
         die("could not find note data on the page (private link or page format changed)")
 
-    vault = os.path.expanduser(args.vault) if args.vault else detect_vault()
-    folder = args.folder or os.environ.get("GRANOLA_FOLDER", DEFAULT_FOLDER)
-    folder_path = os.path.join(vault, folder)
-    os.makedirs(folder_path, exist_ok=True)
-
-    existing = already_imported(folder_path, note["id"])
+    try:
+        existing = already_imported(folder_path, note["id"])
+    except OSError as exc:
+        die_vault_error(exc, folder_path)
     if existing and not args.force:
         log(f"skip existing={existing}")
         print(f"already imported: {existing}")
@@ -379,12 +654,19 @@ def main():
             folder_path,
             f"{local_date(note['created'])} {sanitize_filename(note['title'])}.md",
         )
-        if os.path.exists(path):
+        try:
+            same_name = os.path.exists(path)
+        except OSError as exc:
+            die_vault_error(exc, path)
+        if same_name:
             base, ext = os.path.splitext(path)
             path = f"{base} (2){ext}"
 
-    with open(path, "w", encoding="utf-8") as fh:
-        fh.write(build_markdown(note))
+    try:
+        with open(path, "w", encoding="utf-8") as fh:
+            fh.write(build_markdown(note))
+    except OSError as exc:
+        die_vault_error(exc, path)
 
     log(f"imported={path}")
     print(path)
