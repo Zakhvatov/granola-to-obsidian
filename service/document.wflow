@@ -59,7 +59,7 @@
 				<key>ActionParameters</key>
 				<dict>
 					<key>COMMAND_STRING</key>
-					<string>__SCRIPT__
+					<string>__COMMAND__
 </string>
 					<key>CheckedForUserDefaultShell</key>
 					<true/>

@@ -45,14 +45,24 @@ cd granola-to-obsidian
 ./install.sh
 ```
 
-The installer copies the CLI to `~/.local/bin/granola-import` and creates the
+The installer copies the CLI to `~/.local/bin/granola-import`, builds a small
+`~/Applications/Granola to Obsidian.app` launcher and creates the
 `Granola to Obsidian` Service in `~/Library/Services`.
+
+Why the launcher: a Service inherits the privacy permissions of whichever app is
+frontmost when it fires, so a script started straight from Automator loses
+access to a vault in `~/Documents` as soon as that app has none. The app bundle
+has an identity of its own, so one permission covers every run.
 
 Then assign a shortcut once:
 
 **System Settings -> Keyboard -> Keyboard Shortcuts... -> Services ->
 Granola to Obsidian** and record a combination, for example
 `Control+Option+Command+G`.
+
+The first time the shortcut runs, macOS asks whether "Granola to Obsidian" may
+access your Documents folder: allow it. Alternatively add the app under
+**Privacy & Security -> Full Disk Access** yourself.
 
 ## Usage
 
@@ -116,6 +126,13 @@ links, tokens or personal paths.
 ## Troubleshooting
 
 Logs are written to `~/.local/state/granola-import.log`.
+
+If the import fails with `Operation not permitted` for a vault inside
+`~/Documents`, `~/Desktop`, `~/Downloads` or iCloud Drive, macOS is blocking the
+launcher. Add `~/Applications/Granola to Obsidian.app` to
+System Settings -> Privacy & Security -> Full Disk Access, or enable the app
+named in the error. The failed run logs the calling app too, so check the log
+when the name is not obvious.
 
 If the Service does not appear in System Settings, run `./install.sh` again and
 check that `~/Library/Services/Granola to Obsidian.workflow` exists.
